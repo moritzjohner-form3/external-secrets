@@ -36,6 +36,22 @@ type MockSetNamespaceFn func(namespace string)
 
 type MockAddHeaderFn func(key, value string)
 
+type MockLogical func() *vault.Logical
+
+type MockAuth func() *vault.Auth
+
+func NewMockLogicalFn(v *vault.Logical) MockLogical {
+	return func() *vault.Logical {
+		return v
+	}
+}
+
+func NewMockAuthFn(v *vault.Auth) MockAuth {
+	return func() *vault.Auth {
+		return v
+	}
+}
+
 func NewMockNewRequestFn(req *vault.Request) MockNewRequestFn {
 	return func(method, requestPath string) *vault.Request {
 		return req
@@ -116,6 +132,8 @@ func NewAddHeaderFn() MockAddHeaderFn {
 }
 
 type VaultClient struct {
+	MockLogical               MockLogical
+	MockAuth                  MockAuth
 	MockNewRequest            MockNewRequestFn
 	MockRawRequestWithContext MockRawRequestWithContextFn
 	MockSetToken              MockSetTokenFn
@@ -125,12 +143,12 @@ type VaultClient struct {
 	MockAddHeader             MockAddHeaderFn
 }
 
-func (c *VaultClient) NewRequest(method, requestPath string) *vault.Request {
-	return c.MockNewRequest(method, requestPath)
+func (c *VaultClient) Logical() *vault.Logical {
+	return c.MockLogical()
 }
 
-func (c *VaultClient) RawRequestWithContext(ctx context.Context, r *vault.Request) (*vault.Response, error) {
-	return c.MockRawRequestWithContext(ctx, r)
+func (c *VaultClient) Auth() *vault.Auth {
+	return c.MockAuth()
 }
 
 func (c *VaultClient) SetToken(v string) {
