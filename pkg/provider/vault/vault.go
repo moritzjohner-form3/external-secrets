@@ -68,9 +68,7 @@ const (
 	errSecretFormat         = "secret data not in expected format"
 	errUnexpectedKey        = "unexpected key in data: %s"
 	errVaultToken           = "cannot parse Vault authentication token: %w"
-	errVaultReqParams       = "cannot set Vault request parameters: %w"
 	errVaultRequest         = "error from Vault request: %w"
-	errVaultResponse        = "cannot parse Vault response: %w"
 	errServiceAccount       = "cannot read Kubernetes service account token from file system: %w"
 	errJwtNoTokenSource     = "neither `secretRef` nor `kubernetesServiceAccountToken` was supplied as token source for jwt authentication"
 	errUnsupportedKvVersion = "cannot perform find operations with kv version v1"
@@ -106,21 +104,84 @@ const (
 	errInvalidTokenRef   = "invalid Auth.TokenSecretRef: %w"
 )
 
+type Auth interface {
+	Login(ctx context.Context, authMethod vault.AuthMethod) (*vault.Secret, error)
+}
+
+type Token interface {
+	RevokeSelfWithContext(ctx context.Context, token string) error
+	LookupSelfWithContext(ctx context.Context) (*vault.Secret, error)
+}
+
+type Logical interface {
+	ReadWithDataWithContext(ctx context.Context, path string, data map[string][]string) (*vault.Secret, error)
+	ListWithContext(ctx context.Context, path string) (*vault.Secret, error)
+	WriteWithContext(ctx context.Context, path string, data map[string]interface{}) (*vault.Secret, error)
+}
+
 type Client interface {
 	SetToken(v string)
 	Token() string
 	ClearToken()
-	Auth() *vault.Auth
-	Logical() *vault.Logical
+	Auth() Auth
+	Logical() Logical
+	AuthToken() Token
 	SetNamespace(namespace string)
 	AddHeader(key, value string)
 }
+
+type VClient struct {
+	setToken     func(v string)
+	token        func() string
+	clearToken   func()
+	auth         Auth
+	logical      Logical
+	authToken    Token
+	setNamespace func(namespace string)
+	addHeader    func(key, value string)
+}
+
+func (v VClient) AddHeader(key, value string) {
+	v.addHeader(key, value)
+}
+
+func (v VClient) SetNamespace(namespace string) {
+	v.setNamespace(namespace)
+}
+
+func (v VClient) ClearToken() {
+	v.clearToken()
+}
+
+func (v VClient) Token() string {
+	return v.token()
+}
+
+func (v VClient) SetToken(token string) {
+	v.setToken(token)
+}
+
+func (v VClient) Auth() Auth {
+	return v.auth
+}
+
+func (v VClient) AuthToken() Token {
+	return v.authToken
+}
+
+func (v VClient) Logical() Logical {
+	return v.logical
+}
+
 type client struct {
 	kube      kclient.Client
 	store     *esv1beta1.VaultProvider
 	log       logr.Logger
 	corev1    typedcorev1.CoreV1Interface
 	client    Client
+	auth      Auth
+	logical   Logical
+	token     Token
 	namespace string
 	storeKind string
 }
@@ -134,7 +195,24 @@ func init() {
 }
 
 func newVaultClient(c *vault.Config) (Client, error) {
-	return vault.NewClient(c)
+	cl, err := vault.NewClient(c)
+	if err != nil {
+		return nil, err
+	}
+	auth := cl.Auth()
+	logical := cl.Logical()
+	token := cl.Auth().Token()
+	out := VClient{
+		setToken:     cl.SetToken,
+		token:        cl.Token,
+		clearToken:   cl.ClearToken,
+		auth:         auth,
+		authToken:    token,
+		logical:      logical,
+		setNamespace: cl.SetNamespace,
+		addHeader:    cl.AddHeader,
+	}
+	return out, nil
 }
 
 type connector struct {
@@ -189,12 +267,14 @@ func (c *connector) newClient(ctx context.Context, store esv1beta1.GenericStore,
 	if vaultSpec.ReadYourWrites && vaultSpec.ForwardInconsistent {
 		client.AddHeader("X-Vault-Inconsistent", "forward-active-node")
 	}
+	vStore.client = client
+	vStore.auth = client.Auth()
+	vStore.logical = client.Logical()
+	vStore.token = client.AuthToken()
 
-	if err := vStore.setAuth(ctx, client, cfg); err != nil {
+	if err := vStore.setAuth(ctx, cfg); err != nil {
 		return nil, err
 	}
-
-	vStore.client = client
 
 	return vStore, nil
 }
@@ -338,7 +418,7 @@ func (v *client) listSecrets(ctx context.Context, path string) ([]string, error)
 	if err != nil {
 		return nil, err
 	}
-	secret, err := v.client.Logical().ListWithContext(ctx, url)
+	secret, err := v.logical.ListWithContext(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf(errReadSecret, err)
 	}
@@ -373,7 +453,7 @@ func (v *client) readSecretMetadata(ctx context.Context, path string) (map[strin
 	if err != nil {
 		return nil, err
 	}
-	secret, err := v.client.Logical().ReadWithContext(ctx, url)
+	secret, err := v.logical.ReadWithDataWithContext(ctx, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf(errReadSecret, err)
 	}
@@ -482,7 +562,7 @@ func (v *client) Close(ctx context.Context) error {
 			return fmt.Errorf(errVaultRevokeToken, err)
 		}
 		if revoke {
-			err = v.client.Auth().Token().RevokeSelfWithContext(ctx, v.client.Token())
+			err = v.token.RevokeSelfWithContext(ctx, v.client.Token())
 			if err != nil {
 				return fmt.Errorf(errVaultRevokeToken, err)
 			}
@@ -546,9 +626,14 @@ func (v *client) readSecret(ctx context.Context, path, version string) (map[stri
 	// path formated according to vault docs for v1 and v2 API
 	// v1: https://www.vaultproject.io/api-docs/secret/kv/kv-v1#read-secret
 	// v2: https://www.vaultproject.io/api/secret/kv/kv-v2#read-secret-version
-	vaultSecret, err := v.client.Logical().ReadWithContext(ctx, dataPath)
+	var params map[string][]string
+	if version != "" {
+		params = make(map[string][]string)
+		params["version"] = []string{version}
+	}
+	vaultSecret, err := v.logical.ReadWithDataWithContext(ctx, dataPath, params)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf(errReadSecret, err)
 	}
 	secretData := vaultSecret.Data
 	if v.store.Version == esv1beta1.VaultKVStoreV2 {
@@ -665,33 +750,33 @@ func getCertFromConfigMap(v *client) ([]byte, error) {
 	return []byte(val), nil
 }
 
-func (v *client) setAuth(ctx context.Context, client Client, cfg *vault.Config) error {
-	tokenExists, err := setSecretKeyToken(ctx, v, client)
+func (v *client) setAuth(ctx context.Context, cfg *vault.Config) error {
+	tokenExists, err := setSecretKeyToken(ctx, v)
 	if tokenExists {
 		return err
 	}
 
-	tokenExists, err = setAppRoleToken(ctx, v, client)
+	tokenExists, err = setAppRoleToken(ctx, v)
 	if tokenExists {
 		return err
 	}
 
-	tokenExists, err = setKubernetesAuthToken(ctx, v, client)
+	tokenExists, err = setKubernetesAuthToken(ctx, v)
 	if tokenExists {
 		return err
 	}
 
-	tokenExists, err = setLdapAuthToken(ctx, v, client)
+	tokenExists, err = setLdapAuthToken(ctx, v)
 	if tokenExists {
 		return err
 	}
 
-	tokenExists, err = setJwtAuthToken(ctx, v, client)
+	tokenExists, err = setJwtAuthToken(ctx, v)
 	if tokenExists {
 		return err
 	}
 
-	tokenExists, err = setCertAuthToken(ctx, v, client, cfg)
+	tokenExists, err = setCertAuthToken(ctx, v, cfg)
 	if tokenExists {
 		return err
 	}
@@ -699,23 +784,23 @@ func (v *client) setAuth(ctx context.Context, client Client, cfg *vault.Config) 
 	return errors.New(errAuthFormat)
 }
 
-func setAppRoleToken(ctx context.Context, v *client, client Client) (bool, error) {
+func setAppRoleToken(ctx context.Context, v *client) (bool, error) {
 	tokenRef := v.store.Auth.TokenSecretRef
 	if tokenRef != nil {
 		token, err := v.secretKeyRef(ctx, tokenRef)
 		if err != nil {
 			return true, err
 		}
-		client.SetToken(token)
+		v.client.SetToken(token)
 		return true, nil
 	}
 	return false, nil
 }
 
-func setSecretKeyToken(ctx context.Context, v *client, client Client) (bool, error) {
+func setSecretKeyToken(ctx context.Context, v *client) (bool, error) {
 	appRole := v.store.Auth.AppRole
 	if appRole != nil {
-		err := v.requestTokenWithAppRoleRef(ctx, client, appRole)
+		err := v.requestTokenWithAppRoleRef(ctx, appRole)
 		if err != nil {
 			return true, err
 		}
@@ -724,10 +809,10 @@ func setSecretKeyToken(ctx context.Context, v *client, client Client) (bool, err
 	return false, nil
 }
 
-func setKubernetesAuthToken(ctx context.Context, v *client, client Client) (bool, error) {
+func setKubernetesAuthToken(ctx context.Context, v *client) (bool, error) {
 	kubernetesAuth := v.store.Auth.Kubernetes
 	if kubernetesAuth != nil {
-		err := v.requestTokenWithKubernetesAuth(ctx, client, kubernetesAuth)
+		err := v.requestTokenWithKubernetesAuth(ctx, kubernetesAuth)
 		if err != nil {
 			return true, err
 		}
@@ -736,10 +821,10 @@ func setKubernetesAuthToken(ctx context.Context, v *client, client Client) (bool
 	return false, nil
 }
 
-func setLdapAuthToken(ctx context.Context, v *client, client Client) (bool, error) {
+func setLdapAuthToken(ctx context.Context, v *client) (bool, error) {
 	ldapAuth := v.store.Auth.Ldap
 	if ldapAuth != nil {
-		err := v.requestTokenWithLdapAuth(ctx, client, ldapAuth)
+		err := v.requestTokenWithLdapAuth(ctx, ldapAuth)
 		if err != nil {
 			return true, err
 		}
@@ -748,10 +833,10 @@ func setLdapAuthToken(ctx context.Context, v *client, client Client) (bool, erro
 	return false, nil
 }
 
-func setJwtAuthToken(ctx context.Context, v *client, client Client) (bool, error) {
+func setJwtAuthToken(ctx context.Context, v *client) (bool, error) {
 	jwtAuth := v.store.Auth.Jwt
 	if jwtAuth != nil {
-		err := v.requestTokenWithJwtAuth(ctx, client, jwtAuth)
+		err := v.requestTokenWithJwtAuth(ctx, jwtAuth)
 		if err != nil {
 			return true, err
 		}
@@ -760,10 +845,10 @@ func setJwtAuthToken(ctx context.Context, v *client, client Client) (bool, error
 	return false, nil
 }
 
-func setCertAuthToken(ctx context.Context, v *client, client Client, cfg *vault.Config) (bool, error) {
+func setCertAuthToken(ctx context.Context, v *client, cfg *vault.Config) (bool, error) {
 	certAuth := v.store.Auth.Cert
 	if certAuth != nil {
-		err := v.requestTokenWithCertAuth(ctx, client, certAuth, cfg)
+		err := v.requestTokenWithCertAuth(ctx, certAuth, cfg)
 		if err != nil {
 			return true, err
 		}
@@ -854,12 +939,12 @@ func (v *client) serviceAccountToken(ctx context.Context, serviceAccountRef esme
 // checkToken does a lookup and checks if the provided token exists.
 func checkToken(ctx context.Context, vStore *client) (bool, error) {
 	// https://www.vaultproject.io/api-docs/auth/token#lookup-a-token-self
-	resp, err := vStore.client.Auth().Token().LookupSelf()
+	resp, err := vStore.token.LookupSelfWithContext(ctx)
 	if err != nil {
 		return false, err
 	}
 	t, ok := resp.Data["type"]
-	if ok == false {
+	if !ok {
 		return false, fmt.Errorf("could not assert token type")
 	}
 	tokenType := t.(string)
@@ -869,7 +954,7 @@ func checkToken(ctx context.Context, vStore *client) (bool, error) {
 	return true, nil
 }
 
-func (v *client) requestTokenWithAppRoleRef(ctx context.Context, client Client, appRole *esv1beta1.VaultAppRole) error {
+func (v *client) requestTokenWithAppRoleRef(ctx context.Context, appRole *esv1beta1.VaultAppRole) error {
 	roleID := strings.TrimSpace(appRole.RoleID)
 
 	secretID, err := v.secretKeyRef(ctx, &appRole.SecretRef)
@@ -881,14 +966,14 @@ func (v *client) requestTokenWithAppRoleRef(ctx context.Context, client Client, 
 	if err != nil {
 		return err
 	}
-	_, err = client.Auth().Login(ctx, appRoleClient)
+	_, err = v.auth.Login(ctx, appRoleClient)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (v *client) requestTokenWithKubernetesAuth(ctx context.Context, client Client, kubernetesAuth *esv1beta1.VaultKubernetesAuth) error {
+func (v *client) requestTokenWithKubernetesAuth(ctx context.Context, kubernetesAuth *esv1beta1.VaultKubernetesAuth) error {
 	jwtString, err := getJwtString(ctx, v, kubernetesAuth)
 	if err != nil {
 		return err
@@ -897,7 +982,7 @@ func (v *client) requestTokenWithKubernetesAuth(ctx context.Context, client Clie
 	if err != nil {
 		return err
 	}
-	_, err = client.Auth().Login(ctx, k)
+	_, err = v.auth.Login(ctx, k)
 	if err != nil {
 		return err
 	}
@@ -937,7 +1022,7 @@ func getJwtString(ctx context.Context, v *client, kubernetesAuth *esv1beta1.Vaul
 	}
 }
 
-func (v *client) requestTokenWithLdapAuth(ctx context.Context, client Client, ldapAuth *esv1beta1.VaultLdapAuth) error {
+func (v *client) requestTokenWithLdapAuth(ctx context.Context, ldapAuth *esv1beta1.VaultLdapAuth) error {
 	username := strings.TrimSpace(ldapAuth.Username)
 
 	password, err := v.secretKeyRef(ctx, &ldapAuth.SecretRef)
@@ -949,14 +1034,14 @@ func (v *client) requestTokenWithLdapAuth(ctx context.Context, client Client, ld
 	if err != nil {
 		return err
 	}
-	_, err = client.Auth().Login(ctx, l)
+	_, err = v.auth.Login(ctx, l)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (v *client) requestTokenWithJwtAuth(ctx context.Context, client Client, jwtAuth *esv1beta1.VaultJwtAuth) error {
+func (v *client) requestTokenWithJwtAuth(ctx context.Context, jwtAuth *esv1beta1.VaultJwtAuth) error {
 	role := strings.TrimSpace(jwtAuth.Role)
 	var jwt string
 	var err error
@@ -985,7 +1070,7 @@ func (v *client) requestTokenWithJwtAuth(ctx context.Context, client Client, jwt
 		"jwt":  jwt,
 	}
 	url := strings.Join([]string{"auth", jwtAuth.Path, "login"}, "/")
-	vaultResult, err := client.Logical().WriteWithContext(ctx, url, parameters)
+	vaultResult, err := v.logical.WriteWithContext(ctx, url, parameters)
 	if err != nil {
 		return err
 	}
@@ -994,11 +1079,11 @@ func (v *client) requestTokenWithJwtAuth(ctx context.Context, client Client, jwt
 	if err != nil {
 		return fmt.Errorf(errVaultToken, err)
 	}
-	client.SetToken(token)
+	v.client.SetToken(token)
 	return nil
 }
 
-func (v *client) requestTokenWithCertAuth(ctx context.Context, client Client, certAuth *esv1beta1.VaultCertAuth, cfg *vault.Config) error {
+func (v *client) requestTokenWithCertAuth(ctx context.Context, certAuth *esv1beta1.VaultCertAuth, cfg *vault.Config) error {
 	clientKey, err := v.secretKeyRef(ctx, &certAuth.SecretRef)
 	if err != nil {
 		return err
@@ -1019,7 +1104,7 @@ func (v *client) requestTokenWithCertAuth(ctx context.Context, client Client, ce
 	}
 
 	url := strings.Join([]string{"auth", "cert", "login"}, "/")
-	vaultResult, err := client.Logical().WriteWithContext(ctx, url, nil)
+	vaultResult, err := v.logical.WriteWithContext(ctx, url, nil)
 	if err != nil {
 		return fmt.Errorf(errVaultRequest, err)
 	}
@@ -1027,6 +1112,6 @@ func (v *client) requestTokenWithCertAuth(ctx context.Context, client Client, ce
 	if err != nil {
 		return fmt.Errorf(errVaultToken, err)
 	}
-	client.SetToken(token)
+	v.client.SetToken(token)
 	return nil
 }
