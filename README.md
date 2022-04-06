@@ -81,3 +81,7 @@ Please create a PR and add your company or your project to our [ADOPTERS](ADOPTE
 
 ![](assets/CS_logo_1.png)
 ![](assets/Godaddylogo_2020.png)
+
+## Sponsored by
+
+![](assets/form3_logo.png)

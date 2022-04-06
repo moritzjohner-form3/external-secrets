@@ -49,3 +49,7 @@ How to get involved:
 
 ![cs-logo](./pictures/cs_logo.png)
 ![godaddy-logo](./pictures/godaddy_logo.png)
+
+### Sponsored by
+
+![Form3](./pictures/form3_logo.png)
